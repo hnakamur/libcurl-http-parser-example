@@ -2,7 +2,7 @@ CFLAGS=-g -O0
 LDFLAGS=-lcurl -lhttp_parser
 
 hello: hello.c
-	cc -o hello hello.c $(CFLAGS) $(LDFLAGS)
+	cc -o hello hello.c my_http.c $(CFLAGS) $(LDFLAGS)
 
 https_get: https_get.c
 	cc -o https_get https_get.c $(CFLAGS) $(LDFLAGS)
