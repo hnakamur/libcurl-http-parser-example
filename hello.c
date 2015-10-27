@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,120 +7,192 @@
 #include <http_parser.h>
 
 typedef struct {
+  char *field;
+  size_t field_len;
+  char *value;
+  size_t value_len;
+} header_line;
+
+typedef struct {
+  /* NOTE: parser must be the first field since we cast (http_parser *) to (my_http_client *)
+   * in our code.
+   */
   http_parser parser;
   http_parser_settings settings;
-} http_parser_with_settings;
+  int parser_initialized;
+  int last_was_value;
+  size_t nlines;
+  header_line *lines;
+  CURL *curl;
+  int has_error;
+} my_http_client;
 
-static void trim(char **start, char **end) {
-    while (*start < *end && isspace(**start)) {
-      *start = *start + 1;
-    }
-    while (*start < *end && isspace(**end)) {
-      *end = *end - 1;
-    }
-}
-
-static void split_header_name_and_value(char *buffer, size_t buffer_len,
-        char **name, size_t *name_len, char **value, size_t *value_len) {
-  char *name_end, *value_end, *save_ptr;
-  *name = strtok_r(buffer, ":", &save_ptr);
-  if (*name == NULL) {
-    return;
-  }
-  name_end = save_ptr;
-  *value = strtok_r(NULL, "\r", &save_ptr);
-  if (*value == NULL) {
-    return;
-  }
-  value_end = save_ptr;
-
-  trim(name, &name_end);
-  trim(value, &value_end);
-  *name_len = name_end - *name;
-  *value_len = value_end - *value;
-}
-
-static void write_strn(char *s, size_t len) {
+static void write_strn(const char *s, size_t len) {
   fwrite(s, len, 1, stdout);
 }
 
-static void write_str(char *s) {
+static void write_str(const char *s) {
   write_strn(s, strlen(s));
+}
+
+static void print_header_lines(header_line *lines, size_t nlines) {
+  int i;
+  header_line *line;
+
+  for (i = 0; i < nlines; i++) {
+    line = &lines[i];
+    write_str("field:");
+    write_strn(line->field, line->field_len);
+    write_str("\tvalue:");
+    write_strn(line->value, line->value_len);
+    write_str("\n");
+  }
+}
+
+static void cleanup_header_lines(header_line *lines, size_t nlines) {
+  int i;
+  header_line *line;
+
+  for (i = 0; i < nlines; i++) {
+    line = &lines[i];
+    if (line) {
+      if (line->field) {
+        free(line->field);
+      }
+      if (line->value) {
+        free(line->value);
+      }
+    }
+  }
+}
+
+static int my_url_callback(http_parser *parser, const char *at, size_t length) {
+  printf("my_url_callback. length=%d, at=%s\n", length, at);
+  return 0;
+}
+
+static int on_header_field(http_parser *parser, const char *at, size_t len) {
+  my_http_client *client = (my_http_client *)parser;
+  header_line *current_line;
+
+  if (client->last_was_value) {
+    client->nlines++;
+    client->lines = realloc(client->lines, client->nlines * sizeof(header_line));
+    assert(client->lines != NULL);
+    current_line = &client->lines[client->nlines - 1];
+    
+    current_line->value = NULL;
+    current_line->value_len = 0;
+
+    current_line->field_len = len;
+    current_line->field = malloc(len+1);
+    assert(current_line->field != NULL);
+    strncpy(current_line->field, at, len);
+
+  } else {
+    current_line = &client->lines[client->nlines - 1];
+    assert(current_line->value == NULL);
+    assert(current_line->value_len == 0);
+
+    current_line->field_len += len;
+    current_line->field = realloc(current_line->field,
+        current_line->field_len+1);
+    assert(current_line->field != NULL);
+    strncat(current_line->field, at, len);
+  }
+
+  current_line->field[current_line->field_len] = '\0';
+  client->last_was_value = 0;
+  return 0;
+}
+
+static int on_header_value(http_parser *parser, const char *at, size_t len) {
+  my_http_client *client = (my_http_client *)parser;
+  header_line *current_line = &client->lines[client->nlines - 1];
+  if (!client->last_was_value) {
+    current_line->value_len = len;
+    current_line->value = malloc(len+1);
+    assert(current_line->value != NULL);
+    strncpy(current_line->value, at, len);
+  } else {
+    current_line->value_len += len;
+    current_line->value = realloc(current_line->value,
+        current_line->value_len+1);
+    assert(current_line->value != NULL);
+    strncat(current_line->value, at, len);
+  }
+
+  current_line->value[current_line->value_len] = '\0';
+  client->last_was_value = 1;
+
+  return 0;
 }
 
 size_t header_callback(char *ptr, size_t size, size_t nitems, void *userdata) {
   size_t r, nparsed;
-  http_parser_with_settings *pws;
+  my_http_client *client;
+  CURLcode res;
+  curl_socket_t socket;
+
+  client = (my_http_client *)userdata;
+//  printf("header_callback start. parser_initialized=%d\n", client->parser_initialized);
+  if (!client->parser_initialized) {
+//    res = curl_easy_getinfo(client->curl, CURLINFO_LASTSOCKET, &socket);
+//    printf("got lastsocket. res=%d, socket=%x\n", res, socket);
+//    if (res != CURLE_OK) {
+//      fprintf(stderr, "curl_easy_getinfo CURLINFO_ACTIVESOCKET failed: %s\n",
+//              curl_easy_strerror(res));
+//      return 0;
+//    }
+
+    client->settings.on_url = my_url_callback;
+    client->settings.on_header_field = on_header_field;
+    client->settings.on_header_value = on_header_value;
+    http_parser_init(&client->parser, HTTP_RESPONSE);
+//    client->parser.data = (void *)socket;
+    client->parser_initialized = 1;
+    client->last_was_value = 1;
+  }
 
   r = size * nitems;
   if (r == 0) {
     return 0;
   }
 
-  pws = (http_parser_with_settings *)userdata;
-  nparsed = http_parser_execute(&pws->parser, &pws->settings, ptr, r);
+  nparsed = http_parser_execute(&client->parser, &client->settings, ptr, r);
   return nparsed;
-/*
-  char *name, *value;
-  size_t name_len, value_len;
-
-  if (size > 0 && nitems > 0) {
-    split_header_name_and_value(ptr, r, &name, &name_len, &value, &value_len);
-    if (name && value) {
-      write_str("header name=");
-      write_strn(name, name_len);
-      write_str(", value=");
-      write_strn(value, value_len);
-      write_str(".\n");
-    }
-  }
-  return r;
-*/
 }
 
 size_t write_callback(char *ptr, size_t size, size_t nitems, void *userdata) {
   uint r;
   r = size * nitems;
-/*
   if (size > 0 && nitems > 0) {
-    fwrite(ptr, size, nitems, stdout);
+    write_strn(ptr, r);
   }
-*/
   return r;
 }
 
-static int my_url_callback(http_parser *parser, const char *at, size_t length) {
-  return 0;
-}
-
-static int my_header_field_callback(http_parser *parser, const char *at, size_t length) {
-  return 0;
-}
-
-int main(void) {
+int main(int argc, char **argv) {
   CURL *curl;
   CURLcode res;
-  curl_socket_t socket;
-  http_parser_with_settings pws;
+  my_http_client client;
+  char *url;
  
+  if (argc != 2) {
+    fprintf(stderr, "Usage: %s url\n", argv[0]);
+    return 1;
+  }
+
+  url = argv[1];
+
   curl_global_init(CURL_GLOBAL_ALL);
  
+  memset(&client, 0, sizeof(my_http_client));
   curl = curl_easy_init();
   if (curl) {
-    res = curl_easy_getinfo(curl, CURLINFO_LASTSOCKET, &socket);
-    if (res != CURLE_OK) {
-      fprintf(stderr, "curl_easy_getinfo CURLINFO_ACTIVESOCKET failed: %s\n",
-              curl_easy_strerror(res));
-    }
-
-    memset(&pws, sizeof(http_parser_with_settings), 0);
-    pws.settings.on_url = my_url_callback;
-    pws.settings.on_header_field = my_header_field_callback;
-//    pws.parser.data = (void *)socket;
-    http_parser_init(&pws.parser, HTTP_RESPONSE);
-
-    curl_easy_setopt(curl, CURLOPT_URL, "http://www.sakura.ad.jp");
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &pws);
+    client.curl = curl;
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &client);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
  
@@ -129,6 +202,8 @@ int main(void) {
               curl_easy_strerror(res));
     }
  
+    print_header_lines(client.lines, client.nlines);
+    cleanup_header_lines(client.lines, client.nlines);
     curl_easy_cleanup(curl);
   }
   curl_global_cleanup();
