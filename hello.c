@@ -20,11 +20,10 @@ typedef struct {
   http_parser parser;
   http_parser_settings settings;
   int parser_initialized;
+  CURL *curl;
   int last_was_value;
   size_t nlines;
   header_line *lines;
-  CURL *curl;
-  int has_error;
 } my_http_client;
 
 static void write_strn(const char *s, size_t len) {
@@ -64,11 +63,6 @@ static void cleanup_header_lines(header_line *lines, size_t nlines) {
       }
     }
   }
-}
-
-static int my_url_callback(http_parser *parser, const char *at, size_t length) {
-  printf("my_url_callback. length=%d, at=%s\n", length, at);
-  return 0;
 }
 
 static int on_header_field(http_parser *parser, const char *at, size_t len) {
@@ -124,7 +118,6 @@ static int on_header_value(http_parser *parser, const char *at, size_t len) {
 
   current_line->value[current_line->value_len] = '\0';
   client->last_was_value = 1;
-
   return 0;
 }
 
@@ -135,32 +128,19 @@ size_t header_callback(char *ptr, size_t size, size_t nitems, void *userdata) {
   curl_socket_t socket;
 
   client = (my_http_client *)userdata;
-//  printf("header_callback start. parser_initialized=%d\n", client->parser_initialized);
   if (!client->parser_initialized) {
-//    res = curl_easy_getinfo(client->curl, CURLINFO_LASTSOCKET, &socket);
-//    printf("got lastsocket. res=%d, socket=%x\n", res, socket);
-//    if (res != CURLE_OK) {
-//      fprintf(stderr, "curl_easy_getinfo CURLINFO_ACTIVESOCKET failed: %s\n",
-//              curl_easy_strerror(res));
-//      return 0;
-//    }
-
-    client->settings.on_url = my_url_callback;
     client->settings.on_header_field = on_header_field;
     client->settings.on_header_value = on_header_value;
     http_parser_init(&client->parser, HTTP_RESPONSE);
-//    client->parser.data = (void *)socket;
     client->parser_initialized = 1;
     client->last_was_value = 1;
   }
 
   r = size * nitems;
-  if (r == 0) {
-    return 0;
+  if (r > 0) {
+    r = http_parser_execute(&client->parser, &client->settings, ptr, r);
   }
-
-  nparsed = http_parser_execute(&client->parser, &client->settings, ptr, r);
-  return nparsed;
+  return r;
 }
 
 size_t write_callback(char *ptr, size_t size, size_t nitems, void *userdata) {
@@ -202,6 +182,7 @@ int main(int argc, char **argv) {
               curl_easy_strerror(res));
     }
  
+    write_str("\n");
     print_header_lines(client.lines, client.nlines);
     cleanup_header_lines(client.lines, client.nlines);
     curl_easy_cleanup(curl);
